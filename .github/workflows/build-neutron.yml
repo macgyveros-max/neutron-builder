@@ -1,0 +1,83 @@
+name: Build Neutron Browser (H.264) via Conda-Forge
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-neutron-h264:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Miniforge (Conda-Forge)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-variant: Miniforge3
+          miniforge-version: latest
+          activate-environment: neutron_env
+          channels: conda-forge
+          channel-priority: strict
+          conda-remove-defaults: true
+
+      - name: Install Python, PyQt6, Qt6-WebEngine (H.264) and PyInstaller
+        shell: pwsh
+        run: |
+          # 1. ติดตั้ง qt6-main และ qt6-webengine (พร้อม H.264) จาก Conda-Forge
+          mamba install -y -c conda-forge python=3.12 qt6-main=6.11.* qt6-webengine=6.11.* cryptography
+          
+          # 2. ติดตั้ง PyQt6 6.11.0 และ PyInstaller
+          pip install PyQt6==6.11.0 PyQt6-Qt6==6.11.0 PyQt6-WebEngine==6.11.0 PyQt6-WebEngine-Qt6==6.11.0 pyinstaller
+
+      - name: Inject Conda-Forge H.264 WebEngine into PyQt6 & Build EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sitePkg = (python -c "import site; print(site.getsitepackages()[0])" | Select-Object -Last 1).Trim()
+          if (-not (Test-Path "$sitePkg\PyQt6\Qt6\bin")) {
+            $sitePkg = "$env:CONDA_PREFIX\Lib\site-packages"
+          }
+          $pyqtBin = "$sitePkg\PyQt6\Qt6\bin"
+          $pyqtRes = "$sitePkg\PyQt6\Qt6\resources"
+          $pyqtTrans = "$sitePkg\PyQt6\Qt6\translations\qtwebengine_locales"
+
+          $libRoot = "$env:CONDA_PREFIX\Library"
+          $coreDll = Get-ChildItem -Path $libRoot -Filter "Qt6WebEngineCore.dll" -Recurse | Select-Object -First 1
+          $condaQtBin = $coreDll.DirectoryName
+
+          Write-Host "Replacing ONLY Qt6WebEngineCore.dll and its FFmpeg/ICU dependencies..."
+          # คัดลอกเฉพาะ Qt6WebEngine*.dll, QtWebEngineProcess.exe และ Dependency ของมัน (ไม่ทับ Qt6Core/Gui/Widgets เดิมของ PyQt6 เพื่อป้องกัน DLL ขาด)
+          Copy-Item "$condaQtBin\Qt6WebEngine*.dll" -Destination $pyqtBin -Force
+          Get-ChildItem -Path $libRoot -Filter "QtWebEngineProcess.exe" -Recurse | ForEach-Object {
+            Copy-Item $_.FullName -Destination $pyqtBin -Force
+          }
+
+          # คัดลอก DLL เสริมทั้งหมดใน Library\bin ที่ Qt6WebEngineCore.dll ของ Conda-Forge ต้องใช้ (โดยไม่ทับ Qt6*.dll ตัวอื่น)
+          Get-ChildItem -Path "$libRoot\bin\*.dll" | Where-Object { $_.Name -notlike "Qt6*.dll" } | ForEach-Object {
+            Copy-Item $_.FullName -Destination $pyqtBin -Force
+          }
+
+          # คัดลอก Resources และ Locales
+          Get-ChildItem -Path $libRoot -Include "qtwebengine*.pak", "icudtl.dat", "v8_context_snapshot*.bin" -Recurse | ForEach-Object {
+            Copy-Item $_.FullName -Destination $pyqtRes -Force
+          }
+
+          # ทดสอบ Import ก่อนสั่ง PyInstaller เพื่อยืนยันว่าไม่มี DLL ตัวไหนขาด
+          python -c "import PyQt6.QtWebEngineCore, PyQt6.QtWebEngineWidgets; print('WebEngine Import Test: SUCCESS!')"
+
+          # ถ้าระบุไฟล์ neutron_v1.6.1.py ไว้ใน Repo จะสั่ง PyInstaller สร้างโฟลเดอร์ Neutron ทันที
+          if (Test-Path "neutron_v1.6.1.py") {
+            $iconArg = if (Test-Path "neutron.ico") { "--icon=neutron.ico" } else { "" }
+            python -m PyInstaller --noconfirm --clean --onedir $iconArg --windowed --name Neutron --distpath dist --workpath build neutron_v1.6.1.py
+          } else {
+            New-Item -ItemType Directory -Force -Path "dist\PyQt6_Ready_DropIn" | Out-Null
+            Copy-Item "$sitePkg\PyQt6" -Destination "dist\PyQt6_Ready_DropIn\PyQt6" -Recurse -Force
+          }
+
+      - name: Upload Built Neutron / Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Neutron
+          path: dist\
+          retention-days: 14

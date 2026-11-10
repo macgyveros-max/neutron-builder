@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_version:
-        description: 'ระบุเวอร์ชัน Qt6 (เช่น 6.12.* หรือปล่อย * เพื่อใช้ตัวล่าสุดใน Conda-Forge)'
+        description: 'ระบุเวอร์ชัน Qt6 (เช่น 6.12.*, 6.11.* หรือปล่อย * เพื่อเอาตัวล่าสุด)'
         required: true
         default: '*'
 
@@ -25,14 +25,13 @@ jobs:
           channels: conda-forge
           channel-priority: strict
 
-      - name: Install Qt6 WebEngine with Proprietary Codecs
-        shell: pwsh
+      - name: Search and Install qt6-webengine (C++ DLLs with H.264)
+        shell: cmd /C "{0}"
         run: |
-          mamba install -y -c conda-forge "python=3.12" "qt6-main=${{ inputs.target_version }}" "qt6-webengine=${{ inputs.target_version }}" "pyqt6=${{ inputs.target_version }}" "pyqt6-webengine=${{ inputs.target_version }}"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "ไม่พบเวอร์ชัน ${{ inputs.target_version }} บน Conda-Forge กำลังติดตั้งเวอร์ชัน 6.x ล่าสุดแทน..."
-            mamba install -y -c conda-forge "python=3.12" qt6-main qt6-webengine pyqt6 pyqt6-webengine
-          }
+          echo === Checking available qt6-webengine versions on Conda-Forge ===
+          call mamba search qt6-webengine -c conda-forge
+          echo === Installing qt6-main and qt6-webengine ===
+          call mamba install -y -c conda-forge "qt6-main=${{ inputs.target_version }}" "qt6-webengine=${{ inputs.target_version }}" || call mamba install -y -c conda-forge qt6-main qt6-webengine
 
       - name: Package Qt6WebEngineCore.dll and Dependencies
         shell: pwsh
@@ -46,18 +45,32 @@ jobs:
           $condaRes = "$env:CONDA_PREFIX\Library\resources"
           $condaTrans = "$env:CONDA_PREFIX\Library\translations"
 
-          Copy-Item "$condaBin\Qt6WebEngine*.dll" -Destination "$outDir\bin\" -Force
+          # คัดลอก Qt6WebEngineCore.dll และ Qt6 Core DLLs ทั้งชุดเพื่อให้ไม่มีปัญหา DLL ขัดแย้งกัน
+          Copy-Item "$condaBin\Qt6*.dll" -Destination "$outDir\bin\" -Force
           Copy-Item "$condaBin\QtWebEngineProcess.exe" -Destination "$outDir\bin\" -Force
+
+          # คัดลอก FFmpeg / ICU / Codec dependencies ที่ Qt6WebEngineCore.dll เรียกใช้
           Copy-Item "$condaBin\av*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
           Copy-Item "$condaBin\sw*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
           Copy-Item "$condaBin\icu*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$condaBin\lib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$condaBin\zlib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$condaBin\zstd*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$condaBin\jpeg*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
 
+          # คัดลอก Resources และ Translations
           Copy-Item "$condaRes\*" -Destination "$outDir\resources\" -Recurse -Force -ErrorAction SilentlyContinue
           Copy-Item "$condaTrans\qtwebengine_locales" -Destination "$outDir\translations\" -Recurse -Force -ErrorAction SilentlyContinue
 
-          $ver = (Get-Item "$outDir\bin\Qt6WebEngineCore.dll").VersionInfo.FileVersion
-          Write-Host "Extracted Qt6WebEngineCore.dll version: $ver"
-          "Qt6WebEngineCore.dll Version: $ver" | Out-File "$outDir\README_VERSION.txt"
+          $dllPath = "$outDir\bin\Qt6WebEngineCore.dll"
+          if (Test-Path $dllPath) {
+            $ver = (Get-Item $dllPath).VersionInfo.FileVersion
+            Write-Host "Successfully packaged Qt6WebEngineCore.dll version: $ver"
+            "Qt6WebEngineCore.dll Version: $ver" | Out-File "$outDir\README_VERSION.txt"
+          } else {
+            Write-Error "Qt6WebEngineCore.dll not found in $condaBin!"
+            exit 1
+          }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

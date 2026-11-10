@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_version:
-        description: 'ระบุเวอร์ชัน Qt6 (เช่น 6.12.*, 6.11.* หรือปล่อย * เพื่อเอาตัวล่าสุด)'
+        description: 'ระบุเวอร์ชัน Qt6 (เช่น 6.12.*, 6.11.* หรือ * เพื่อเอาตัวล่าสุด)'
         required: true
         default: '*'
 
@@ -24,53 +24,78 @@ jobs:
           activate-environment: qt6_h264
           channels: conda-forge
           channel-priority: strict
+          conda-remove-defaults: true
 
-      - name: Search and Install qt6-webengine (C++ DLLs with H.264)
-        shell: cmd /C "{0}"
-        run: |
-          echo === Checking available qt6-webengine versions on Conda-Forge ===
-          call mamba search qt6-webengine -c conda-forge
-          echo === Installing qt6-main and qt6-webengine ===
-          call mamba install -y -c conda-forge "qt6-main=${{ inputs.target_version }}" "qt6-webengine=${{ inputs.target_version }}" || call mamba install -y -c conda-forge qt6-main qt6-webengine
-
-      - name: Package Qt6WebEngineCore.dll and Dependencies
+      - name: Install Qt6 WebEngine with Proprietary Codecs
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "Searching available qt6-webengine versions on conda-forge..."
+          mamba search qt6-webengine -c conda-forge
+
+          Write-Host "Attempting to install version: ${{ inputs.target_version }}"
+          mamba install -y -c conda-forge "qt6-main=${{ inputs.target_version }}" "qt6-webengine=${{ inputs.target_version }}"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Version ${{ inputs.target_version }} not available yet on conda-forge. Installing latest available qt6-webengine..."
+            mamba install -y -c conda-forge qt6-main qt6-webengine
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to install qt6-webengine from conda-forge"
+            }
+          }
+
+      - name: Locate and Package Qt6WebEngineCore.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $outDir = "${{ github.workspace }}\Qt6WebEngine_H264_Pack"
           New-Item -ItemType Directory -Force -Path "$outDir\bin" | Out-Null
           New-Item -ItemType Directory -Force -Path "$outDir\resources" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$outDir\translations" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir\translations\qtwebengine_locales" | Out-Null
 
-          $condaBin = "$env:CONDA_PREFIX\Library\bin"
-          $condaRes = "$env:CONDA_PREFIX\Library\resources"
-          $condaTrans = "$env:CONDA_PREFIX\Library\translations"
+          $libRoot = "$env:CONDA_PREFIX\Library"
+          Write-Host "Searching for Qt6WebEngineCore.dll inside $libRoot ..."
 
-          # คัดลอก Qt6WebEngineCore.dll และ Qt6 Core DLLs ทั้งชุดเพื่อให้ไม่มีปัญหา DLL ขัดแย้งกัน
-          Copy-Item "$condaBin\Qt6*.dll" -Destination "$outDir\bin\" -Force
-          Copy-Item "$condaBin\QtWebEngineProcess.exe" -Destination "$outDir\bin\" -Force
-
-          # คัดลอก FFmpeg / ICU / Codec dependencies ที่ Qt6WebEngineCore.dll เรียกใช้
-          Copy-Item "$condaBin\av*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\sw*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\icu*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\lib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\zlib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\zstd*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$condaBin\jpeg*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-
-          # คัดลอก Resources และ Translations
-          Copy-Item "$condaRes\*" -Destination "$outDir\resources\" -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item "$condaTrans\qtwebengine_locales" -Destination "$outDir\translations\" -Recurse -Force -ErrorAction SilentlyContinue
-
-          $dllPath = "$outDir\bin\Qt6WebEngineCore.dll"
-          if (Test-Path $dllPath) {
-            $ver = (Get-Item $dllPath).VersionInfo.FileVersion
-            Write-Host "Successfully packaged Qt6WebEngineCore.dll version: $ver"
-            "Qt6WebEngineCore.dll Version: $ver" | Out-File "$outDir\README_VERSION.txt"
-          } else {
-            Write-Error "Qt6WebEngineCore.dll not found in $condaBin!"
-            exit 1
+          # ค้นหาตำแหน่งจริงของ Qt6WebEngineCore.dll (รองรับทั้ง Library\lib\qt6\bin และ Library\bin)
+          $coreDll = Get-ChildItem -Path $libRoot -Filter "Qt6WebEngineCore.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $coreDll) {
+            throw "Could not find Qt6WebEngineCore.dll in $libRoot"
           }
+
+          $qtBinDir = $coreDll.DirectoryName
+          Write-Host "Found Qt6 binaries at: $qtBinDir"
+
+          # 1. คัดลอก Qt6WebEngine DLLs และ Qt6 Core DLLs จากโฟลเดอร์ qt6\bin
+          Copy-Item "$qtBinDir\Qt6*.dll" -Destination "$outDir\bin\" -Force
+
+          # 2. ค้นหาและคัดลอก QtWebEngineProcess.exe
+          Get-ChildItem -Path $libRoot -Filter "QtWebEngineProcess.exe" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination "$outDir\bin\" -Force
+          }
+
+          # 3. คัดลอก FFmpeg / ICU / Dependency DLLs จาก Library\bin (จำเป็นสำหรับถอดรหัส H.264)
+          $mainBin = "$libRoot\bin"
+          if (Test-Path $mainBin) {
+            Copy-Item "$mainBin\av*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+            Copy-Item "$mainBin\sw*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+            Copy-Item "$mainBin\icu*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+            Copy-Item "$mainBin\lib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
+          }
+
+          # 4. ค้นหาและคัดลอกไฟล์ Resources (.pak และ icudtl.dat)
+          Get-ChildItem -Path $libRoot -Include "qtwebengine*.pak", "icudtl.dat", "v8_context_snapshot*.bin" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination "$outDir\resources\" -Force
+          }
+
+          # 5. ค้นหาและคัดลอกไฟล์ Locales (.pak)
+          Get-ChildItem -Path $libRoot -Directory -Filter "qtwebengine_locales" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item "$($_.FullName)\*" -Destination "$outDir\translations\qtwebengine_locales\" -Force -ErrorAction SilentlyContinue
+          }
+
+          $ver = (Get-Item "$outDir\bin\Qt6WebEngineCore.dll").VersionInfo.FileVersion
+          Write-Host "Successfully packaged Qt6WebEngineCore.dll version: $ver"
+          
+          "Qt6WebEngineCore.dll Version: $ver`r`nSource Path: $qtBinDir" | Out-File "$outDir\README_VERSION.txt"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

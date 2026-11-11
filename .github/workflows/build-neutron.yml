@@ -1,4 +1,4 @@
-name: Build Neutron Browser (H.264) via Conda-Forge
+name: Build Neutron Browser
 
 on:
   workflow_dispatch:

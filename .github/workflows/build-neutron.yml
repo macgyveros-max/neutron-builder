@@ -1,7 +1,10 @@
-name: Build Neutron Browser
+name: Build Neutron Browser (H.264) via Conda-Forge
 
 on:
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-neutron-h264:
@@ -21,86 +24,46 @@ jobs:
           channel-priority: strict
           conda-remove-defaults: true
 
-      - name: Install Conda-Forge Qt6 + WebEngine (H.264) + PyQt6
+      - name: Install Conda-Forge PyQt6 + WebEngine (H.264) + PyInstaller
         shell: pwsh
         run: |
-          # 1. ติดตั้ง qt6-main, qt6-webengine (ที่เปิด H.264 มาแล้ว) และ pyqt (PyQt6) จาก Conda-Forge
-          mamba install -y -c conda-forge python=3.12 qt6-main qt6-webengine pyqt pyqt-builder sip cryptography pyinstaller
+          # ใช้ชื่อแพ็กเกจ pyqt6 และ pyqt6-webengine ของ Conda-Forge โดยตรง
+          mamba install -y -c conda-forge python=3.12 pyqt6 pyqt6-sip pyqt6-webengine qt6-main qt6-webengine cryptography pyinstaller
 
-      - name: Setup MSVC & Build PyQt6-WebEngine Bindings against Conda-Forge Qt6
-        uses: ilammy/msvc-dev-cmd@v1
+          # ทดสอบโหลดโมดูลเพื่อยืนยันว่า DLL ทุกตัวทำงานร่วมกันได้ 100%
+          python -c "import PyQt6.QtCore, PyQt6.QtWebEngineCore, PyQt6.QtWebEngineWidgets; print('SUCCESS! Qt Version:', PyQt6.QtCore.QT_VERSION_STR)"
 
-      - name: Compile Thin Python Bindings for PyQt6-WebEngine
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          # คอมไพล์เฉพาะตัวเชื่อม Python (.pyd ขนาดเล็ก ใช้เวลา ~1-2 นาที) ให้ตรงกับ Qt6WebEngineCore.dll ของ Conda-Forge เป๊ะๆ
-          $env:PATH = "$env:CONDA_PREFIX\Library\lib\qt6\bin;$env:CONDA_PREFIX\Library\bin;$env:PATH"
-          
-          pip install --no-deps --no-build-isolation --no-binary :all: PyQt6-WebEngine
-
-          # ทดสอบโหลดโมดูลเพื่อยืนยันว่าใช้งานร่วมกันได้ 100%
-          python -c "import PyQt6.QtCore, PyQt6.QtWebEngineCore, PyQt6.QtWebEngineWidgets; print('ALL LOADED SUCCESSFULLY! Qt Version:', PyQt6.QtCore.QT_VERSION_STR)"
-
-      - name: Package Neutron EXE with PyInstaller
+      - name: Build Neutron EXE with PyInstaller
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $env:PATH = "$env:CONDA_PREFIX\Library\lib\qt6\bin;$env:CONDA_PREFIX\Library\bin;$env:PATH"
 
-          $scriptFile = Get-ChildItem -Path . -Filter "neutron_v1.6.1*" | Select-Object -First 1
-          if (-not $scriptFile) {
-            throw "ไม่พบไฟล์ neutron_v1.6.1.py ใน Repository!"
-          }
-
-          # ถ้าไฟล์ลงท้ายด้วย .py.txt ให้ก๊อปปี้เป็น .py ก่อนเพื่อให้ PyInstaller ทำงานได้ถูกต้อง
-          Copy-Item $scriptFile.FullName -Destination "neutron_main.py" -Force
-
-          $iconArg = @()
-          if (Test-Path "neutron.ico") {
-            $iconArg = @("--icon=neutron.ico")
-          }
-
-          python -m PyInstaller --noconfirm --clean --onedir @iconArg --windowed --name Neutron `
-            --paths "$env:CONDA_PREFIX\Library\lib\qt6\bin" `
-            --paths "$env:CONDA_PREFIX\Library\bin" `
+          # เรียกใช้ไฟล์ neutron_v1.6.1.py และ neutron.ico ที่มีอยู่ใน Git โดยตรง
+          python -m PyInstaller --noconfirm --clean --onedir --icon=neutron.ico --windowed --name Neutron `
             --collect-all PyQt6 `
-            --distpath dist --workpath build neutron_main.py
+            --distpath dist --workpath build neutron_v1.6.1.py
 
-          $libRoot = "$env:CONDA_PREFIX\Library"
+          # คัดลอก QtWebEngineProcess.exe และ resources จาก Conda-Forge เข้าสู่โฟลเดอร์ _internal เพื่อให้ WebEngine ทำงานได้ครบถ้วน
+          $libBin = "$env:CONDA_PREFIX\Library\bin"
+          $libRes = "$env:CONDA_PREFIX\Library\resources"
+          $libTrans = "$env:CONDA_PREFIX\Library\translations\qtwebengine_locales"
           $targetInternal = "dist\Neutron\_internal"
 
-          # คัดลอก Qt6WebEngineCore.dll, QtWebEngineProcess.exe และ DLL พื้นฐานทั้งหมดของ Conda-Forge เข้า _internal
-          Copy-Item "$libRoot\bin\*.dll" -Destination "$targetInternal\" -Force -ErrorAction SilentlyContinue
-          if (Test-Path "$libRoot\lib\qt6\bin") {
-            Copy-Item "$libRoot\lib\qt6\bin\*.dll" -Destination "$targetInternal\" -Force -ErrorAction SilentlyContinue
+          if (Test-Path "$libBin\QtWebEngineProcess.exe") {
+            Copy-Item "$libBin\QtWebEngineProcess.exe" -Destination "$targetInternal\" -Force
           }
 
-          Get-ChildItem -Path $libRoot -Filter "QtWebEngineProcess.exe" -Recurse | ForEach-Object {
-            Copy-Item $_.FullName -Destination "$targetInternal\" -Force
-            Copy-Item $_.FullName -Destination "dist\Neutron\" -Force
+          if (Test-Path $libRes) {
+            New-Item -ItemType Directory -Force -Path "$targetInternal\resources" | Out-Null
+            Copy-Item "$libRes\*" -Destination "$targetInternal\resources\" -Recurse -Force
           }
 
-          # คัดลอก Qt Plugins (platforms/qwindows.dll ฯลฯ เพื่อให้เปิดหน้าต่าง GUI ขึ้น)
-          Get-ChildItem -Path $libRoot -Directory -Filter "plugins" -Recurse | ForEach-Object {
-            Copy-Item "$($_.FullName)\*" -Destination "$targetInternal\PyQt6\Qt6\plugins\" -Recurse -Force -ErrorAction SilentlyContinue
-            Copy-Item "$($_.FullName)\*" -Destination "$targetInternal\plugins\" -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path $libTrans) {
+            New-Item -ItemType Directory -Force -Path "$targetInternal\translations\qtwebengine_locales" | Out-Null
+            Copy-Item "$libTrans\*" -Destination "$targetInternal\translations\qtwebengine_locales\" -Recurse -Force
           }
 
-          # คัดลอก Resources (.pak และ icudtl.dat)
-          New-Item -ItemType Directory -Force -Path "$targetInternal\resources" | Out-Null
-          Get-ChildItem -Path $libRoot -Include "qtwebengine*.pak", "icudtl.dat", "v8_context_snapshot*.bin" -Recurse | ForEach-Object {
-            Copy-Item $_.FullName -Destination "$targetInternal\resources\" -Force
-            Copy-Item $_.FullName -Destination "$targetInternal\" -Force
-          }
-
-          # คัดลอก Locales
-          New-Item -ItemType Directory -Force -Path "$targetInternal\translations\qtwebengine_locales" | Out-Null
-          Get-ChildItem -Path $libRoot -Directory -Filter "qtwebengine_locales" -Recurse | ForEach-Object {
-            Copy-Item "$($_.FullName)\*" -Destination "$targetInternal\translations\qtwebengine_locales\" -Force -ErrorAction SilentlyContinue
-          }
-
-          Write-Host "Neutron H.264 Build Completed!"
+          Write-Host "Build Neutron completed successfully!"
 
       - name: Upload Built Neutron Browser
         uses: actions/upload-artifact@v4

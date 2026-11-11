@@ -1,105 +1,114 @@
-name: Build Qt6WebEngineCore (H.264) via Conda-Forge
+name: Compile Qt6WebEngineCore.dll (H.264 Source Build)
 
 on:
   workflow_dispatch:
     inputs:
-      target_version:
-        description: 'ระบุเวอร์ชัน Qt6 (เช่น 6.12.*, 6.11.* หรือ * เพื่อเอาตัวล่าสุด)'
+      qt_version:
+        description: 'เวอร์ชันของ Qt ที่ต้องการคอมไพล์ (แนะนำ 6.12.0 ให้ตรงกับ PyQt6 ของคุณ)'
         required: true
-        default: '*'
+        default: '6.12.0'
 
 jobs:
-  build-h264-dll:
+  compile-webengine-h264:
     runs-on: windows-latest
+    # กำหนดเวลาสูงสุดที่ GitHub Actions อนุญาต (360 นาที = 6 ชั่วโมง)
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Miniforge (Conda-Forge)
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Free up Disk Space & Configure Pagefile (RAM)
+        shell: pwsh
+        run: |
+          Write-Host "Freeing up disk space on runner..."
+          # ลบโฟลเดอร์ Android / .NET / Haskell ที่ไม่ได้ใช้เพื่อให้มีพื้นที่ว่างเกิน 60 GB สำหรับคอมไพล์ Chromium
+          Remove-Item -Path "C:\Android" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Program Files\dotnet" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\ghcup" -Recurse -Force -ErrorAction SilentlyContinue
+          Get-PSDrive C
+
+      - name: Setup Python & Node.js
+        uses: actions/setup-python@v5
         with:
-          miniforge-variant: Miniforge3
-          miniforge-version: latest
-          activate-environment: qt6_h264
-          channels: conda-forge
-          channel-priority: strict
-          conda-remove-defaults: true
+          python-version: '3.11'
 
-      - name: Install Qt6 WebEngine with Proprietary Codecs
+      - name: Setup Node.js (Required by Chromium build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Build Tools (Ninja, CMake, GPerf, Bison, Flex, aqtinstall)
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
-          Write-Host "Searching available qt6-webengine versions on conda-forge..."
-          mamba search qt6-webengine -c conda-forge
+          choco install -y winflexbison3 gperf ninja cmake
+          python -m pip install --upgrade pip
+          pip install aqtinstall html5lib spdx-tools
 
-          Write-Host "Attempting to install version: ${{ inputs.target_version }}"
-          mamba install -y -c conda-forge "qt6-main=${{ inputs.target_version }}" "qt6-webengine=${{ inputs.target_version }}"
+          # ติดตั้ง Qt Base + Dependencies สำเร็จรูปจาก Official Qt Server (ไม่ต้องเสียเวลาคอมไพล์ QtBase เอง)
+          $qtVer = "${{ inputs.qt_version }}"
+          Write-Host "Installing Official Qt $qtVer (win64_msvc2022_64)..."
+          aqt install-qt windows desktop $qtVer win64_msvc2022_64 -O C:\Qt -m qtshadertools qtdeclarative qtpositioning qtwebchannel qtwebsockets
+
+      - name: Download QtWebEngine Source Code
+        shell: pwsh
+        run: |
+          $qtVer = "${{ inputs.qt_version }}"
+          New-Item -ItemType Directory -Force -Path "C:\w" | Out-Null
+          Set-Location "C:\w"
+
+          Write-Host "Cloning qtwebengine v$qtVer source code..."
+          git clone --branch "v$qtVer" --depth 1 --recurse-submodules --shallow-submodules https://code.qt.io/qt/qtwebengine.git src
+
+      - name: Configure & Compile Qt6WebEngineCore.dll with Proprietary Codecs (H.264)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set PATH=C:\Qt\${{ inputs.qt_version }}\msvc2022_64\bin;C:\ProgramData\chocolatey\bin;%PATH%
           
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Version ${{ inputs.target_version }} not available yet on conda-forge. Installing latest available qt6-webengine..."
-            mamba install -y -c conda-forge qt6-main qt6-webengine
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to install qt6-webengine from conda-forge"
-            }
-          }
+          REM ปิด Debug Symbols ของ Chromium เพื่อลดการใช้ RAM/Disk และเร่งความเร็วการคอมไพล์
+          set NINJAFLAGS=-j4
+          set GN_DEFINES=symbol_level=0 blink_symbol_level=0 enable_precompiled_headers=false
 
-      - name: Locate and Package Qt6WebEngineCore.dll
+          mkdir C:\w\b
+          cd /d C:\w\b
+
+          echo Configuring QtWebEngine with -DFEATURE_webengine_proprietary_codecs=ON ...
+          call C:\Qt\${{ inputs.qt_version }}\msvc2022_64\bin\qt-configure-module.bat C:\w\src -- ^
+            -DFEATURE_webengine_proprietary_codecs=ON ^
+            -DFEATURE_webengine_kerberos=ON ^
+            -DFEATURE_webengine_webrtc=ON ^
+            -DFEATURE_webengine_Full_debug_info=OFF ^
+            -DCMAKE_BUILD_TYPE=Release
+
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+          echo Starting Ninja Build (This will take ~3 to 4.5 hours)...
+          cmake --build . --parallel 4
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+          cmake --install . --prefix C:\w\out
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+      - name: Package Compiled H.264 Qt6WebEngineCore.dll
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $outDir = "${{ github.workspace }}\Qt6WebEngine_H264_Pack"
+          $outDir = "${{ github.workspace }}\Qt6WebEngine_H264_Compiled_${{ inputs.qt_version }}"
           New-Item -ItemType Directory -Force -Path "$outDir\bin" | Out-Null
           New-Item -ItemType Directory -Force -Path "$outDir\resources" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$outDir\translations\qtwebengine_locales" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir\translations" | Out-Null
 
-          $libRoot = "$env:CONDA_PREFIX\Library"
-          Write-Host "Searching for Qt6WebEngineCore.dll inside $libRoot ..."
-
-          # ค้นหาตำแหน่งจริงของ Qt6WebEngineCore.dll (รองรับทั้ง Library\lib\qt6\bin และ Library\bin)
-          $coreDll = Get-ChildItem -Path $libRoot -Filter "Qt6WebEngineCore.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $coreDll) {
-            throw "Could not find Qt6WebEngineCore.dll in $libRoot"
-          }
-
-          $qtBinDir = $coreDll.DirectoryName
-          Write-Host "Found Qt6 binaries at: $qtBinDir"
-
-          # 1. คัดลอก Qt6WebEngine DLLs และ Qt6 Core DLLs จากโฟลเดอร์ qt6\bin
-          Copy-Item "$qtBinDir\Qt6*.dll" -Destination "$outDir\bin\" -Force
-
-          # 2. ค้นหาและคัดลอก QtWebEngineProcess.exe
-          Get-ChildItem -Path $libRoot -Filter "QtWebEngineProcess.exe" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName -Destination "$outDir\bin\" -Force
-          }
-
-          # 3. คัดลอก FFmpeg / ICU / Dependency DLLs จาก Library\bin (จำเป็นสำหรับถอดรหัส H.264)
-          $mainBin = "$libRoot\bin"
-          if (Test-Path $mainBin) {
-            Copy-Item "$mainBin\av*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-            Copy-Item "$mainBin\sw*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-            Copy-Item "$mainBin\icu*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-            Copy-Item "$mainBin\lib*.dll" -Destination "$outDir\bin\" -ErrorAction SilentlyContinue
-          }
-
-          # 4. ค้นหาและคัดลอกไฟล์ Resources (.pak และ icudtl.dat)
-          Get-ChildItem -Path $libRoot -Include "qtwebengine*.pak", "icudtl.dat", "v8_context_snapshot*.bin" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName -Destination "$outDir\resources\" -Force
-          }
-
-          # 5. ค้นหาและคัดลอกไฟล์ Locales (.pak)
-          Get-ChildItem -Path $libRoot -Directory -Filter "qtwebengine_locales" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item "$($_.FullName)\*" -Destination "$outDir\translations\qtwebengine_locales\" -Force -ErrorAction SilentlyContinue
-          }
+          Copy-Item "C:\w\out\bin\Qt6WebEngine*.dll" -Destination "$outDir\bin\" -Force
+          Copy-Item "C:\w\out\bin\QtWebEngineProcess.exe" -Destination "$outDir\bin\" -Force
+          Copy-Item "C:\w\out\resources\*" -Destination "$outDir\resources\" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "C:\w\out\translations\*" -Destination "$outDir\translations\" -Recurse -Force -ErrorAction SilentlyContinue
 
           $ver = (Get-Item "$outDir\bin\Qt6WebEngineCore.dll").VersionInfo.FileVersion
-          Write-Host "Successfully packaged Qt6WebEngineCore.dll version: $ver"
-          
-          "Qt6WebEngineCore.dll Version: $ver`r`nSource Path: $qtBinDir" | Out-File "$outDir\README_VERSION.txt"
+          "Qt6WebEngineCore.dll Version: $ver (Compiled from Source with -DFEATURE_webengine_proprietary_codecs=ON)" | Out-File "$outDir\README_VERSION.txt"
 
-      - name: Upload Artifact
+      - name: Upload Compiled H.264 Qt6WebEngineCore Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Qt6WebEngineCore-H264-Package
-          path: ${{ github.workspace }}\Qt6WebEngine_H264_Pack\
-          retention-days: 14
+          name: Qt6WebEngineCore-${{ inputs.qt_version }}-H264-SourceBuild
+          path: ${{ github.workspace }}\Qt6WebEngine_H264_Compiled_${{ inputs.qt_version }}\
+          retention-days: 30

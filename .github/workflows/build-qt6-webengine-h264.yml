@@ -4,61 +4,74 @@ on:
   workflow_dispatch:
     inputs:
       qt_version:
-        description: 'เวอร์ชันของ Qt ที่ต้องการคอมไพล์ (แนะนำ 6.12.0 ให้ตรงกับ PyQt6 ของคุณ)'
+        description: 'เวอร์ชันของ Qt ที่ต้องการคอมไพล์ (เช่น 6.12.0 หรือ 6.11.0)'
         required: true
         default: '6.12.0'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   compile-webengine-h264:
     runs-on: windows-latest
-    # กำหนดเวลาสูงสุดที่ GitHub Actions อนุญาต (360 นาที = 6 ชั่วโมง)
     timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Free up Disk Space & Configure Pagefile (RAM)
+      - name: Free up Disk Space
         shell: pwsh
         run: |
           Write-Host "Freeing up disk space on runner..."
-          # ลบโฟลเดอร์ Android / .NET / Haskell ที่ไม่ได้ใช้เพื่อให้มีพื้นที่ว่างเกิน 60 GB สำหรับคอมไพล์ Chromium
           Remove-Item -Path "C:\Android" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\Program Files\dotnet" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\ghcup" -Recurse -Force -ErrorAction SilentlyContinue
           Get-PSDrive C
 
-      - name: Setup Python & Node.js
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Setup Node.js (Required by Chromium build)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Build Tools (Ninja, CMake, GPerf, Bison, Flex, aqtinstall)
+      - name: Install Build Tools & Official Qt 6.12.0 SDK
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           choco install -y winflexbison3 gperf ninja cmake
           python -m pip install --upgrade pip
-          pip install aqtinstall html5lib spdx-tools
 
-          # ติดตั้ง Qt Base + Dependencies สำเร็จรูปจาก Official Qt Server (ไม่ต้องเสียเวลาคอมไพล์ QtBase เอง)
+          # ติดตั้ง aqtinstall จาก GitHub master เพื่อรองรับโครงสร้างโฟลเดอร์ใหม่ของ Qt 6.11+ และ 6.12+
+          pip install git+https://github.com/miurahr/aqtinstall.git html5lib
+
           $qtVer = "${{ inputs.qt_version }}"
+          Write-Host "Available architectures for Qt $qtVer :"
+          python -m aqt list-qt windows desktop --arch $qtVer
+
           Write-Host "Installing Official Qt $qtVer (win64_msvc2022_64)..."
-          aqt install-qt windows desktop $qtVer win64_msvc2022_64 -O C:\Qt -m qtshadertools qtdeclarative qtpositioning qtwebchannel qtwebsockets
+          python -m aqt install-qt windows desktop $qtVer win64_msvc2022_64 -O C:\Qt -m qtshadertools qtdeclarative qtpositioning qtwebchannel qtwebsockets
 
       - name: Download QtWebEngine Source Code
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $qtVer = "${{ inputs.qt_version }}"
           New-Item -ItemType Directory -Force -Path "C:\w" | Out-Null
           Set-Location "C:\w"
 
-          Write-Host "Cloning qtwebengine v$qtVer source code..."
-          git clone --branch "v$qtVer" --depth 1 --recurse-submodules --shallow-submodules https://code.qt.io/qt/qtwebengine.git src
+          Write-Host "Downloading qtwebengine $qtVer source tarball (faster & smaller than git clone)..."
+          $tarUrl = "https://download.qt.io/official_releases/qt/$($qtVer.Substring(0,4))/$qtVer/submodules/qtwebengine-everywhere-src-$qtVer.tar.xz"
+          Write-Host "Fetching from: $tarUrl"
+          curl.exe -L -o qtwebengine.tar.xz $tarUrl
+
+          Write-Host "Extracting source archive..."
+          7z x qtwebengine.tar.xz -so | 7z x -si -ttar -oC:\w
+          Rename-Item -Path "C:\w\qtwebengine-everywhere-src-$qtVer" -NewName "src"
 
       - name: Configure & Compile Qt6WebEngineCore.dll with Proprietary Codecs (H.264)
         shell: cmd
@@ -66,7 +79,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           set PATH=C:\Qt\${{ inputs.qt_version }}\msvc2022_64\bin;C:\ProgramData\chocolatey\bin;%PATH%
           
-          REM ปิด Debug Symbols ของ Chromium เพื่อลดการใช้ RAM/Disk และเร่งความเร็วการคอมไพล์
+          REM ปิด Debug Symbols เพื่อลดการใช้ RAM/Disk และป้องกัน Out-of-Memory ตอน Link DLL
           set NINJAFLAGS=-j4
           set GN_DEFINES=symbol_level=0 blink_symbol_level=0 enable_precompiled_headers=false
 
@@ -76,14 +89,13 @@ jobs:
           echo Configuring QtWebEngine with -DFEATURE_webengine_proprietary_codecs=ON ...
           call C:\Qt\${{ inputs.qt_version }}\msvc2022_64\bin\qt-configure-module.bat C:\w\src -- ^
             -DFEATURE_webengine_proprietary_codecs=ON ^
-            -DFEATURE_webengine_kerberos=ON ^
             -DFEATURE_webengine_webrtc=ON ^
             -DFEATURE_webengine_Full_debug_info=OFF ^
             -DCMAKE_BUILD_TYPE=Release
 
           if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-          echo Starting Ninja Build (This will take ~3 to 4.5 hours)...
+          echo Starting Ninja Build (Takes ~3 to 4.5 hours)...
           cmake --build . --parallel 4
           if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
